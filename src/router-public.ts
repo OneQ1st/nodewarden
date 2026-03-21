@@ -89,55 +89,68 @@ function normalizeIconHost(rawHost: string): string | null {
   }
 }
 
+// Icons handler - Vercel 优先 + 逐级回退 + Google 兜底（最终版）
 async function handleWebsiteIcon(host: string): Promise<Response> {
   const normalizedHost = normalizeIconHost(host);
   if (!normalizedHost) return handleNwFavicon();
 
-  const encodedHost = encodeURIComponent(normalizedHost);
-  const requestHeaders = { 'User-Agent': 'NodeWarden/1.0' };
-  const upstreamSources: Array<{ url: string; headers?: HeadersInit }> = [
-    {
-      url: `https://icons.bitwarden.net/${encodedHost}/icon.png`,
-      headers: requestHeaders,
-    },
-    {
-      url: `https://favicon.im/${encodedHost}`,
-      headers: requestHeaders,
-    },
-    {
-      url: `https://icons.duckduckgo.com/ip3/${encodedHost}.ico`,
-      headers: requestHeaders,
-    },
-  ];
+  const cache = caches.default;
+  const cacheKey = new Request(`https://nodewarden-icons.local/icons/${normalizedHost}/icon.png`, { method: 'GET' });
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
 
-  try {
-    for (const source of upstreamSources) {
-      const resp = await fetch(source.url, {
-        headers: source.headers,
-        redirect: 'follow',
-        cf: {
-          cacheEverything: true,
-          cacheTtl: LIMITS.cache.iconTtlSeconds,
-        },
-      } as RequestInit & { cf: { cacheEverything: boolean; cacheTtl: number } });
+  let finalResp: Response | null = null;
 
-      if (!resp.ok) continue;
-      const contentType = String(resp.headers.get('Content-Type') || '').toLowerCase();
-      if (!contentType.startsWith('image/')) continue;
+  // 1. Vercel 优先：逐级回退查找（sub.digitalplat.org → digitalplat.org）
+  let parts = normalizedHost.split('.');
+  while (parts.length >= 2) {
+    const currentHost = parts.join('.');
+    const vercelUrl = `https://icon-xi.vercel.app/${currentHost}/icon.png`;
 
-      return new Response(resp.body, {
-        status: 200,
-        headers: {
-          'Content-Type': resp.headers.get('Content-Type') || 'image/png',
-          'Cache-Control': `public, max-age=${LIMITS.cache.iconTtlSeconds}`,
-        },
+    // HEAD 快速探测（只检查是否存在，不下载图片）
+    const vCheck = await fetch(vercelUrl, {
+      method: 'HEAD',
+      headers: { 'User-Agent': 'NodeWarden/1.0' },
+    });
+
+    if (vCheck.ok) {
+      finalResp = await fetch(vercelUrl, {
+        headers: { 'User-Agent': 'NodeWarden/1.0' },
+        cf: { cacheEverything: true, cacheTtl: LIMITS.cache.iconTtlSeconds },
       });
+      break; // 找到就立即返回
     }
 
-    return handleNwFavicon();
-  } catch {
-    return handleNwFavicon();
+    parts.shift(); // 向上级域名回退
   }
+
+  // 2. Google 兜底（Vercel 没找到才走这里）
+  if (!finalResp || !finalResp.ok) {
+    const googleUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(normalizedHost)}&sz=64`;
+    finalResp = await fetch(googleUrl, {
+      headers: { 'User-Agent': 'NodeWarden/1.0' },
+      redirect: 'follow',
+      cf: { cacheEverything: true, cacheTtl: LIMITS.cache.iconTtlSeconds },
+    });
+  }
+
+  // 3. 返回结果并缓存
+  if (finalResp && finalResp.ok) {
+    const body = await finalResp.arrayBuffer();
+    if (body.byteLength === 0) return handleNwFavicon();
+
+    const iconResponse = new Response(body, {
+      status: 200,
+      headers: {
+        'Content-Type': finalResp.headers.get('Content-Type') || 'image/png',
+        'Cache-Control': `public, max-age=${LIMITS.cache.iconTtlSeconds}`,
+      },
+    });
+    await cache.put(cacheKey, iconResponse.clone());
+    return iconResponse;
+  }
+
+  return handleNwFavicon();
 }
 
 export function buildWebBootstrapResponse(env: Env): WebBootstrapResponse {
