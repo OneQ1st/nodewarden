@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS users (
   security_stamp TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user',
   status TEXT NOT NULL DEFAULT 'active',
+  verify_devices INTEGER NOT NULL DEFAULT 1,
   totp_secret TEXT,
   totp_recovery_code TEXT,
   created_at TEXT NOT NULL,
@@ -51,11 +52,14 @@ CREATE TABLE IF NOT EXISTS ciphers (
   key TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  archived_at TEXT,
   deleted_at TEXT,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_ciphers_user_updated ON ciphers(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ciphers_user_archived ON ciphers(user_id, archived_at);
 CREATE INDEX IF NOT EXISTS idx_ciphers_user_deleted ON ciphers(user_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_ciphers_user_deleted_updated ON ciphers(user_id, deleted_at, updated_at);
 
 CREATE TABLE IF NOT EXISTS folders (
   id TEXT PRIMARY KEY,
@@ -103,6 +107,7 @@ CREATE TABLE IF NOT EXISTS sends (
 );
 CREATE INDEX IF NOT EXISTS idx_sends_user_updated ON sends(user_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_sends_user_deletion ON sends(user_id, deletion_date);
+CREATE INDEX IF NOT EXISTS idx_sends_user_updated_id ON sends(user_id, updated_at, id);
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   token TEXT PRIMARY KEY,
@@ -144,12 +149,19 @@ CREATE TABLE IF NOT EXISTS devices (
   device_identifier TEXT NOT NULL,
   name TEXT NOT NULL,
   type INTEGER NOT NULL,
+  session_stamp TEXT,
+  encrypted_user_key TEXT,
+  encrypted_public_key TEXT,
+  encrypted_private_key TEXT,
+  device_note TEXT,
+  last_seen_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (user_id, device_identifier),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_devices_user_updated ON devices(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_devices_user_last_seen ON devices(user_id, last_seen_at);
 
 CREATE TABLE IF NOT EXISTS trusted_two_factor_device_tokens (
   token TEXT PRIMARY KEY,

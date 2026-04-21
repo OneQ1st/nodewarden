@@ -1,4 +1,4 @@
-import type { Env } from '../types';
+import type { Env, User } from '../types';
 import { StorageService } from './storage';
 import {
   type BackupSettingsPortableEnvelope,
@@ -8,6 +8,7 @@ import {
 } from './backup-settings-crypto';
 import {
   BACKUP_DEFAULT_INTERVAL_HOURS,
+  BACKUP_DEFAULT_START_TIME,
   BACKUP_DEFAULT_TIMEZONE,
   type BackupDestinationConfig,
   type BackupDestinationRecord,
@@ -88,6 +89,20 @@ function normalizeIntervalHours(value: unknown, fallback: number = BACKUP_DEFAUL
     throw new Error('Backup interval hours must be between 1 and 99');
   }
   return raw;
+}
+
+function normalizeStartTime(value: unknown, fallback: string = BACKUP_DEFAULT_START_TIME): string {
+  const raw = asTrimmedString(value) || fallback;
+  const match = raw.match(/^(\d{1,2})(?::(\d{1,2}))?$/);
+  if (!match) {
+    throw new Error('Backup start time must be in HH:mm format');
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2] ?? '0');
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    throw new Error('Backup start time must be in HH:mm format');
+  }
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 }
 
 function normalizeE3Destination(value: unknown, allowIncomplete = false): E3BackupDestination {
@@ -219,6 +234,10 @@ function normalizeDestinationRecord(
       scheduleSource.intervalHours ?? previousSchedule.intervalHours,
       previousSchedule.intervalHours || BACKUP_DEFAULT_INTERVAL_HOURS
     ),
+    startTime: normalizeStartTime(
+      scheduleSource.startTime ?? previousSchedule.startTime,
+      previousSchedule.startTime || BACKUP_DEFAULT_START_TIME
+    ),
     timezone: assertValidTimeZone(asTrimmedString(scheduleSource.timezone ?? previousSchedule.timezone) || fallbackTimezone || BACKUP_DEFAULT_TIMEZONE),
     retentionCount: normalizeRetentionCount(retentionSource, previousSchedule.retentionCount),
   };
@@ -259,6 +278,7 @@ function parseLegacyBackupSettings(rawValue: Record<string, unknown>, fallbackTi
     schedule: {
       enabled: !!rawValue.enabled,
       intervalHours,
+      startTime: BACKUP_DEFAULT_START_TIME,
       timezone: assertValidTimeZone(asTrimmedString(rawValue.timezone) || fallbackTimezone || BACKUP_DEFAULT_TIMEZONE),
       retentionCount: 30,
     },
@@ -326,6 +346,7 @@ export function parseBackupSettings(raw: string | null, fallbackTimezone: string
           schedule: {
             enabled: scheduleEnabled,
             intervalHours: globalIntervalHours,
+            startTime: BACKUP_DEFAULT_START_TIME,
             timezone: globalTimezone,
             retentionCount: 30,
           },
@@ -401,20 +422,45 @@ export async function saveBackupSettings(storage: StorageService, env: Env, sett
 export async function normalizeImportedBackupSettings(storage: StorageService, env: Env, fallbackTimezone: string = 'UTC'): Promise<void> {
   const raw = await storage.getConfigValue(BACKUP_SETTINGS_CONFIG_KEY);
   if (!raw) return;
+  const users = await storage.getAllUsers();
+  const normalized = await normalizeImportedBackupSettingsValue(raw, env, users, fallbackTimezone);
+  if (normalized !== null) {
+    await storage.setConfigValue(BACKUP_SETTINGS_CONFIG_KEY, normalized);
+  }
+}
+
+export async function normalizeImportedBackupSettingsValue(
+  raw: string | null,
+  env: Env,
+  users: Pick<User, 'id' | 'publicKey' | 'role' | 'status'>[],
+  fallbackTimezone: string = 'UTC'
+): Promise<string | null> {
+  if (!raw) return null;
   const envelope = parseBackupSettingsEnvelope(raw);
   if (envelope) {
     try {
       const decrypted = await decryptBackupSettingsRuntime(raw, env);
       const settings = parseBackupSettings(decrypted, fallbackTimezone);
-      await saveBackupSettings(storage, env, settings);
-      return;
+      const hasPortableAdmins = users.some(
+        (user) => user.role === 'admin' && user.status === 'active' && typeof user.publicKey === 'string' && user.publicKey.trim().length > 0
+      );
+      if (!hasPortableAdmins) {
+        return serializeBackupSettings(settings);
+      }
+      return encryptBackupSettingsEnvelope(serializeBackupSettings(settings), env, users);
     } catch {
       // Keep imported portable recovery data intact until an admin signs in and repairs it.
-      return;
+      return raw;
     }
   }
   const settings = parseBackupSettings(raw, fallbackTimezone);
-  await saveBackupSettings(storage, env, settings);
+  const hasPortableAdmins = users.some(
+    (user) => user.role === 'admin' && user.status === 'active' && typeof user.publicKey === 'string' && user.publicKey.trim().length > 0
+  );
+  if (!hasPortableAdmins) {
+    return serializeBackupSettings(settings);
+  }
+  return encryptBackupSettingsEnvelope(serializeBackupSettings(settings), env, users);
 }
 
 export async function getBackupSettingsRepairState(storage: StorageService, env: Env, fallbackTimezone: string = 'UTC'): Promise<BackupSettingsRepairState> {
@@ -495,15 +541,87 @@ export function getBackupLocalTime(date: Date, timezone: string): string {
   return `${parts.hour}:${parts.minute}`;
 }
 
+function parseLocalDateKey(dateKey: string): { year: number; month: number; day: number } | null {
+  const match = String(dateKey || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  return { year, month, day };
+}
+
+function getUtcDateForLocalTime(timezone: string, year: number, month: number, day: number, hour: number, minute: number): Date {
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+  const actual = getDateTimeParts(new Date(utcGuess), timezone);
+  const actualUtc = Date.UTC(
+    Number(actual.year),
+    Number(actual.month) - 1,
+    Number(actual.day),
+    Number(actual.hour),
+    Number(actual.minute),
+    0,
+    0
+  );
+  const desiredUtc = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+  return new Date(utcGuess - (actualUtc - desiredUtc));
+}
+
+function getBackupSlotStartsForLocalDay(
+  dateKey: string,
+  timezone: string,
+  startTime: string,
+  intervalHours: number
+): Date[] {
+  const parsedDate = parseLocalDateKey(dateKey);
+  const parsedTime = normalizeStartTime(startTime).split(':').map((value) => Number(value));
+  if (!parsedDate || parsedTime.length !== 2) return [];
+
+  const [hour, minute] = parsedTime;
+  const firstSlot = getUtcDateForLocalTime(timezone, parsedDate.year, parsedDate.month, parsedDate.day, hour, minute);
+  const nextLocalDay = new Date(Date.UTC(parsedDate.year, parsedDate.month - 1, parsedDate.day, 0, 0, 0, 0));
+  nextLocalDay.setUTCDate(nextLocalDay.getUTCDate() + 1);
+  const nextDay = getUtcDateForLocalTime(
+    timezone,
+    nextLocalDay.getUTCFullYear(),
+    nextLocalDay.getUTCMonth() + 1,
+    nextLocalDay.getUTCDate(),
+    0,
+    0
+  );
+  const intervalMs = intervalHours * 60 * 60 * 1000;
+  const slots: Date[] = [];
+
+  for (let slotMs = firstSlot.getTime(); slotMs < nextDay.getTime(); slotMs += intervalMs) {
+    slots.push(new Date(slotMs));
+  }
+  return slots;
+}
+
 export function isBackupDueNow(
   destination: BackupDestinationRecord,
   now: Date,
   windowMinutes: number = BACKUP_SCHEDULER_WINDOW_MINUTES
 ): boolean {
   if (!destination.schedule.enabled) return false;
-  const intervalMs = destination.schedule.intervalHours * 60 * 60 * 1000;
   const toleranceMs = Math.max(1, windowMinutes) * 60 * 1000;
   const lastAttemptAt = destination.runtime.lastAttemptAt ? new Date(destination.runtime.lastAttemptAt) : null;
-  if (!lastAttemptAt || !Number.isFinite(lastAttemptAt.getTime())) return true;
-  return now.getTime() - lastAttemptAt.getTime() >= Math.max(0, intervalMs - toleranceMs);
+  const lastAttemptMs = lastAttemptAt && Number.isFinite(lastAttemptAt.getTime())
+    ? lastAttemptAt.getTime()
+    : Number.NEGATIVE_INFINITY;
+  const localDateKey = getBackupLocalDateKey(now, destination.schedule.timezone);
+  const slotStarts = getBackupSlotStartsForLocalDay(
+    localDateKey,
+    destination.schedule.timezone,
+    destination.schedule.startTime,
+    destination.schedule.intervalHours
+  );
+
+  for (const slotStart of slotStarts) {
+    const slotStartMs = slotStart.getTime();
+    if (now.getTime() < slotStartMs || now.getTime() >= slotStartMs + toleranceMs) continue;
+    if (lastAttemptMs >= slotStartMs) return false;
+    return true;
+  }
+  return false;
 }

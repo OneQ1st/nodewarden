@@ -1,6 +1,7 @@
 import { base64ToBytes, bytesToBase64, decryptBw, decryptBwFileData, decryptStr, encryptBw, encryptBwFileData, hkdf, pbkdf2 } from '../crypto';
 import type { Send, SendDraft, SessionState } from '../types';
 import { chunkArray, createApiError, parseErrorMessage, parseJson, uploadDirectEncryptedPayload, type AuthedFetch } from './shared';
+import { loadVaultSyncSnapshot } from './vault-sync';
 
 function toIsoDateFromDays(value: string, required: boolean): string | null {
   const raw = String(value || '').trim();
@@ -61,10 +62,8 @@ function parseMaxAccessCountRaw(value: string): number | null {
 }
 
 export async function getSends(authedFetch: AuthedFetch): Promise<Send[]> {
-  const resp = await authedFetch('/api/sends');
-  if (!resp.ok) throw new Error('Failed to load sends');
-  const body = await parseJson<{ object: 'list'; data: Send[] }>(resp);
-  return body?.data || [];
+  const body = await loadVaultSyncSnapshot(authedFetch);
+  return body.sends || [];
 }
 
 export async function createSend(
@@ -152,10 +151,13 @@ export async function createSend(
   const uploadInfo = await parseJson<{ url?: string; sendResponse?: Send; fileUploadType?: number }>(fileResp);
   const uploadUrl = uploadInfo?.url;
   if (!uploadUrl) throw new Error('Create file send failed: missing upload URL');
+  if (!session.accessToken) throw new Error('Unauthorized');
+  const payload = new ArrayBuffer(encryptedFileBytes.byteLength);
+  new Uint8Array(payload).set(encryptedFileBytes);
   const uploadResp = await uploadDirectEncryptedPayload({
     accessToken: session.accessToken,
     uploadUrl,
-    payload: encryptedFileBytes,
+    payload,
     fileUploadType: uploadInfo?.fileUploadType,
     unsupportedMessage: 'Unsupported send upload type',
     onProgress,

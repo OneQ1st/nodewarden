@@ -52,12 +52,12 @@ function isSameOriginWriteRequest(request: Request): boolean {
   return false;
 }
 
-function getNwIconSvg(): string {
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="NW icon"><rect x="4" y="4" width="88" height="88" rx="20" fill="#111418"/><text x="48" y="60" text-anchor="middle" font-size="36" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-weight="800" letter-spacing="0.5" fill="#FFFFFF">NW</text></svg>`;
+function getDefaultWebsiteIconSvg(): string {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Globe icon"><circle cx="48" cy="48" r="34" fill="none" stroke="#8ea9c7" stroke-width="6"/><path d="M14 48h68M48 14c10 10 16 21.5 16 34s-6 24-16 34c-10-10-16-21.5-16-34s6-24 16-34zm-24 10c8 5 17 8 24 8s16-3 24-8m-48 48c8-5 17-8 24-8s16 3 24 8" fill="none" stroke="#8ea9c7" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
 function handleNwFavicon(): Response {
-  return new Response(getNwIconSvg(), {
+  return new Response(getDefaultWebsiteIconSvg(), {
     status: 200,
     headers: {
       'Content-Type': 'image/svg+xml; charset=utf-8',
@@ -76,6 +76,44 @@ function buildIconServiceTemplate(origin: string): string {
 
 function buildIconServiceCsp(origin: string): string {
   return `img-src 'self' data: ${origin}`;
+}
+
+function buildConfigResponse(origin: string) {
+  return {
+    version: LIMITS.compatibility.bitwardenServerVersion,
+    gitHash: 'nodewarden',
+    server: null,
+    environment: {
+      cloudRegion: 'self-hosted',
+      vault: origin,
+      api: origin + '/api',
+      identity: origin + '/identity',
+      notifications: origin + '/notifications',
+      icons: origin,
+      sso: '',
+      fillAssistRules: null,
+    },
+    push: {
+      pushTechnology: 0,
+      vapidPublicKey: null,
+    },
+    communication: null,
+    settings: {
+      disableUserRegistration: false,
+    },
+    _icon_service_url: buildIconServiceTemplate(origin),
+    _icon_service_csp: buildIconServiceCsp(origin),
+    featureStates: {
+      'cipher-key-encryption': true,
+      'duo-redirect': true,
+      'email-verification': true,
+      'pm-19051-send-email-verification': false,
+      'pm-19148-innovation-archive': true,
+      'unauth-ui-refresh': true,
+      'web-push': false,
+    },
+    object: 'config',
+  };
 }
 
 function normalizeIconHost(rawHost: string): string | null {
@@ -253,6 +291,11 @@ export async function handlePublicRoute(
     return handleKnownDevice(request, env);
   }
 
+  const clearDeviceTokenMatch = path.match(/^\/api\/devices\/identifier\/([^/]+)\/clear-token$/i);
+  if (clearDeviceTokenMatch && (method === 'PUT' || method === 'POST')) {
+    return new Response(null, { status: 200 });
+  }
+
   if ((path === '/identity/connect/revocation' || path === '/identity/connect/revoke') && method === 'POST') {
     const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
     if (blocked) return blocked;
@@ -260,6 +303,12 @@ export async function handlePublicRoute(
   }
 
   if (path === '/identity/accounts/prelogin' && method === 'POST') {
+    const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
+    if (blocked) return blocked;
+    return handlePrelogin(request, env);
+  }
+
+  if (path === '/identity/accounts/prelogin/password' && method === 'POST') {
     const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
     if (blocked) return blocked;
     return handlePrelogin(request, env);
@@ -285,28 +334,7 @@ export async function handlePublicRoute(
     const blocked = await enforcePublicRateLimit('public-read', LIMITS.rateLimit.publicReadRequestsPerMinute);
     if (blocked) return blocked;
     const origin = new URL(request.url).origin;
-    return jsonResponse({
-      version: LIMITS.compatibility.bitwardenServerVersion,
-      gitHash: 'nodewarden',
-      server: null,
-      environment: {
-        vault: origin,
-        api: origin + '/api',
-        identity: origin + '/identity',
-        notifications: origin + '/notifications',
-        icons: origin,
-        sso: '',
-      },
-      _icon_service_url: buildIconServiceTemplate(origin),
-      _icon_service_csp: buildIconServiceCsp(origin),
-      featureStates: {
-        'duo-redirect': true,
-        'email-verification': true,
-        'pm-19051-send-email-verification': false,
-        'unauth-ui-refresh': true,
-      },
-      object: 'config',
-    });
+    return jsonResponse(buildConfigResponse(origin));
   }
 
   if (path === '/api/version' && method === 'GET') {

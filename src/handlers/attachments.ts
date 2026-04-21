@@ -10,7 +10,7 @@ import {
   verifyAttachmentUploadToken,
   verifyFileDownloadToken,
 } from '../utils/jwt';
-import { cipherToResponse, shouldOmitPasskeysForResponse } from './ciphers';
+import { cipherToResponse } from './ciphers';
 import { LIMITS } from '../config/limits';
 import { readActingDeviceIdentifier } from '../utils/device';
 import {
@@ -36,6 +36,18 @@ function formatSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  const limit = Math.max(1, concurrency);
+  for (let index = 0; index < items.length; index += limit) {
+    await Promise.all(items.slice(index, index + limit).map(worker));
+  }
 }
 
 async function processAttachmentUpload(
@@ -158,9 +170,7 @@ export async function handleCreateAttachment(
     attachmentId: attachmentId,
     url: buildDirectUploadUrl(request, `/api/ciphers/${cipherId}/attachment/${attachmentId}`, uploadToken),
     fileUploadType: 1,
-    cipherResponse: cipherToResponse(updatedCipher!, attachments, {
-      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
-    }),
+    cipherResponse: cipherToResponse(updatedCipher!, attachments),
   });
 }
 
@@ -372,9 +382,7 @@ export async function handleDeleteAttachment(
   const attachments = await storage.getAttachmentsByCipher(cipherId);
 
   return jsonResponse({
-    cipher: cipherToResponse(updatedCipher!, attachments, {
-      omitFido2Credentials: shouldOmitPasskeysForResponse(request),
-    }),
+    cipher: cipherToResponse(updatedCipher!, attachments),
   });
 }
 
@@ -385,10 +393,9 @@ export async function deleteAllAttachmentsForCipher(
 ): Promise<void> {
   const storage = new StorageService(env.DB);
   const attachments = await storage.getAttachmentsByCipher(cipherId);
-
-  for (const attachment of attachments) {
+  await runWithConcurrency(attachments, LIMITS.performance.attachmentDeleteConcurrency, async (attachment) => {
     const path = getAttachmentObjectKey(cipherId, attachment.id);
     await deleteBlobObject(env, path);
     await storage.deleteAttachment(attachment.id);
-  }
+  });
 }

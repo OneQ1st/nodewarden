@@ -1,8 +1,8 @@
 import { base64ToBytes, decryptBw, decryptBwFileData, decryptStr, encryptBw, encryptBwFileData } from '../crypto';
 import type {
   Cipher,
+  CipherPasswordHistoryEntry,
   Folder,
-  ListResponse,
   SessionState,
   VaultDraft,
   VaultDraftField,
@@ -16,12 +16,11 @@ import {
   type AuthedFetch,
 } from './shared';
 import { readResponseBytesWithProgress } from '../download';
+import { loadVaultSyncSnapshot } from './vault-sync';
 
 export async function getFolders(authedFetch: AuthedFetch): Promise<Folder[]> {
-  const resp = await authedFetch('/api/folders');
-  if (!resp.ok) throw new Error('Failed to load folders');
-  const body = await parseJson<ListResponse<Folder>>(resp);
-  return body?.data || [];
+  const body = await loadVaultSyncSnapshot(authedFetch);
+  return body.folders || [];
 }
 
 export async function createFolder(
@@ -93,10 +92,8 @@ export async function updateFolder(
 }
 
 export async function getCiphers(authedFetch: AuthedFetch): Promise<Cipher[]> {
-  const resp = await authedFetch('/api/ciphers?deleted=true');
-  if (!resp.ok) throw new Error('Failed to load ciphers');
-  const body = await parseJson<ListResponse<Cipher>>(resp);
-  return body?.data || [];
+  const body = await loadVaultSyncSnapshot(authedFetch);
+  return body.ciphers || [];
 }
 
 export interface CiphersImportPayload {
@@ -240,6 +237,7 @@ export async function uploadCipherAttachment(
   const attachmentId = String(meta.attachmentId || '').trim();
   const uploadUrl = String(meta.url || '').trim();
   if (!attachmentId || !uploadUrl) throw new Error('Create attachment failed');
+  if (!session.accessToken) throw new Error('Unauthorized');
 
   const payload = new ArrayBuffer(encryptedBytes.byteLength);
   new Uint8Array(payload).set(encryptedBytes);
@@ -349,6 +347,61 @@ async function encryptTextValue(value: string, enc: Uint8Array, mac: Uint8Array)
   return encryptBw(new TextEncoder().encode(s), enc, mac);
 }
 
+async function encryptPasswordHistory(
+  entries: CipherPasswordHistoryEntry[] | null | undefined,
+  enc: Uint8Array,
+  mac: Uint8Array
+): Promise<CipherPasswordHistoryEntry[] | null> {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+
+  const out: CipherPasswordHistoryEntry[] = [];
+  for (const entry of entries) {
+    const rawPassword = String(entry?.password || '');
+    const plainPassword = entry?.decPassword ?? rawPassword;
+    const encryptedPassword = looksLikeCipherString(rawPassword)
+      ? rawPassword
+      : await encryptTextValue(plainPassword, enc, mac);
+    if (!encryptedPassword) continue;
+    out.push({
+      password: encryptedPassword,
+      lastUsedDate: toIsoDateOrNow(entry?.lastUsedDate),
+    });
+  }
+
+  return out.length ? out : null;
+}
+
+async function buildUpdatedPasswordHistory(
+  cipher: Cipher | null,
+  draft: VaultDraft,
+  enc: Uint8Array,
+  mac: Uint8Array
+): Promise<CipherPasswordHistoryEntry[] | null> {
+  const existingHistory = Array.isArray(cipher?.passwordHistory) ? cipher.passwordHistory : [];
+  const currentPassword = String(cipher?.login?.decPassword || '');
+  const nextPassword = String(draft.loginPassword || '');
+  const passwordChanged = currentPassword !== nextPassword;
+  const history = await encryptPasswordHistory(existingHistory, enc, mac);
+
+  if (!passwordChanged || !currentPassword.trim()) {
+    return history;
+  }
+
+  const encryptedCurrentPassword = await encryptTextValue(currentPassword, enc, mac);
+  if (!encryptedCurrentPassword) {
+    return history;
+  }
+
+  const nextEntries: CipherPasswordHistoryEntry[] = [
+    {
+      password: encryptedCurrentPassword,
+      lastUsedDate: new Date().toISOString(),
+    },
+    ...(history || []),
+  ];
+  return nextEntries.slice(0, 5);
+}
+
 async function encryptCustomFields(
   fields: VaultDraftField[],
   enc: Uint8Array,
@@ -367,12 +420,27 @@ async function encryptCustomFields(
   return out;
 }
 
-async function encryptUris(uris: string[], enc: Uint8Array, mac: Uint8Array): Promise<Array<{ uri: string | null; match: null }>> {
-  const out: Array<{ uri: string | null; match: null }> = [];
-  for (const uri of uris || []) {
-    const trimmed = String(uri || '').trim();
+async function encryptUris(
+  uris: VaultDraft['loginUris'],
+  enc: Uint8Array,
+  mac: Uint8Array
+): Promise<Array<Record<string, unknown>>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const entry of uris || []) {
+    const trimmed = String(entry?.uri || '').trim();
     if (!trimmed) continue;
-    out.push({ uri: await encryptTextValue(trimmed, enc, mac), match: null });
+    const preservedExtra =
+      entry?.extra && typeof entry.extra === 'object'
+        ? { ...entry.extra }
+        : {};
+    if (String(entry?.originalUri || '').trim() !== trimmed) {
+      delete preservedExtra.uriChecksum;
+    }
+    out.push({
+      ...preservedExtra,
+      uri: await encryptTextValue(trimmed, enc, mac),
+      match: typeof entry?.match === 'number' && Number.isFinite(entry.match) ? entry.match : null,
+    });
   }
   return out;
 }
@@ -461,6 +529,7 @@ async function buildCipherPayload(
   const userMac = base64ToBytes(session.symMacKey);
   const keys = await getCipherKeys(cipher, userEnc, userMac);
   const type = Number(draft.type || cipher?.type || 1);
+  const now = new Date().toISOString();
 
   const payload: Record<string, unknown> = {
     type,
@@ -475,6 +544,7 @@ async function buildCipherPayload(
     secureNote: null,
     sshKey: null,
     fields: await encryptCustomFields(draft.customFields || [], keys.enc, keys.mac),
+    passwordHistory: await encryptPasswordHistory(cipher?.passwordHistory, keys.enc, keys.mac),
   };
 
   if (cipher?.id) {
@@ -483,17 +553,25 @@ async function buildCipherPayload(
   }
 
   if (type === 1) {
+    const passwordChanged = String(cipher?.login?.decPassword || '') !== String(draft.loginPassword || '');
     const existingFido2 =
       cipher?.login && Array.isArray((cipher.login as any).fido2Credentials)
         ? (cipher.login as any).fido2Credentials
         : draft.loginFido2Credentials;
+    const existingLogin =
+      cipher?.login && typeof cipher.login === 'object'
+        ? { ...(cipher.login as Record<string, unknown>) }
+        : {};
     payload.login = {
+      ...existingLogin,
       username: await encryptTextValue(draft.loginUsername, keys.enc, keys.mac),
       password: await encryptTextValue(draft.loginPassword, keys.enc, keys.mac),
       totp: await encryptTextValue(draft.loginTotp, keys.enc, keys.mac),
+      passwordRevisionDate: passwordChanged ? now : existingLogin.passwordRevisionDate ?? null,
       fido2Credentials: await normalizeFido2Credentials(existingFido2, keys.enc, keys.mac),
       uris: await encryptUris(draft.loginUris || [], keys.enc, keys.mac),
     };
+    payload.passwordHistory = await buildUpdatedPasswordHistory(cipher, draft, keys.enc, keys.mac);
   } else if (type === 3) {
     payload.card = {
       cardholderName: await encryptTextValue(draft.cardholderName, keys.enc, keys.mac),
@@ -582,6 +660,20 @@ export async function deleteCipher(authedFetch: AuthedFetch, cipherId: string): 
   if (!resp.ok) throw new Error('Delete item failed');
 }
 
+export async function archiveCipher(authedFetch: AuthedFetch, cipherId: string): Promise<void> {
+  const id = String(cipherId || '').trim();
+  if (!id) throw new Error('Cipher id is required');
+  const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/archive`, { method: 'PUT' });
+  if (!resp.ok) throw new Error('Archive item failed');
+}
+
+export async function unarchiveCipher(authedFetch: AuthedFetch, cipherId: string): Promise<void> {
+  const id = String(cipherId || '').trim();
+  if (!id) throw new Error('Cipher id is required');
+  const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(id)}/unarchive`, { method: 'PUT' });
+  if (!resp.ok) throw new Error('Unarchive item failed');
+}
+
 export async function bulkDeleteCiphers(authedFetch: AuthedFetch, ids: string[]): Promise<void> {
   const uniqueIds = Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)));
   for (const chunk of chunkArray(uniqueIds, BULK_API_CHUNK_SIZE)) {
@@ -591,6 +683,18 @@ export async function bulkDeleteCiphers(authedFetch: AuthedFetch, ids: string[])
       body: JSON.stringify({ ids: chunk }),
     });
     if (!resp.ok) throw new Error('Bulk delete failed');
+  }
+}
+
+export async function bulkArchiveCiphers(authedFetch: AuthedFetch, ids: string[]): Promise<void> {
+  const uniqueIds = Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)));
+  for (const chunk of chunkArray(uniqueIds, BULK_API_CHUNK_SIZE)) {
+    const resp = await authedFetch('/api/ciphers/archive', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: chunk }),
+    });
+    if (!resp.ok) throw new Error('Bulk archive failed');
   }
 }
 
@@ -615,6 +719,18 @@ export async function bulkRestoreCiphers(authedFetch: AuthedFetch, ids: string[]
       body: JSON.stringify({ ids: chunk }),
     });
     if (!resp.ok) throw new Error('Bulk restore failed');
+  }
+}
+
+export async function bulkUnarchiveCiphers(authedFetch: AuthedFetch, ids: string[]): Promise<void> {
+  const uniqueIds = Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)));
+  for (const chunk of chunkArray(uniqueIds, BULK_API_CHUNK_SIZE)) {
+    const resp = await authedFetch('/api/ciphers/unarchive', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: chunk }),
+    });
+    if (!resp.ok) throw new Error('Bulk unarchive failed');
   }
 }
 

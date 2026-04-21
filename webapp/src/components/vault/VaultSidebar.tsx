@@ -1,4 +1,5 @@
 import {
+  Archive,
   Copy,
   CreditCard,
   Folder as FolderIcon,
@@ -7,6 +8,7 @@ import {
   Globe,
   KeyRound,
   LayoutGrid,
+  Pencil,
   ShieldUser,
   Star,
   StickyNote,
@@ -27,6 +29,7 @@ interface VaultSidebarProps {
   onChangeFilter: (filter: SidebarFilter) => void;
   onOpenDeleteAllFolders: () => void;
   onOpenCreateFolder: () => void;
+  onOpenRenameFolder: (folder: Folder) => void;
   onOpenDeleteFolder: (folder: Folder) => void;
 }
 
@@ -47,6 +50,9 @@ export default function VaultSidebar(props: VaultSidebarProps) {
         </button>
         <button type="button" className={`tree-btn ${props.sidebarFilter.kind === 'favorite' ? 'active' : ''}`} onClick={() => props.onChangeFilter({ kind: 'favorite' })}>
           <Star size={14} className="tree-icon" /> <span className="tree-label">{t('txt_favorites')}</span>
+        </button>
+        <button type="button" className={`tree-btn ${props.sidebarFilter.kind === 'archive' ? 'active' : ''}`} onClick={() => props.onChangeFilter({ kind: 'archive' })}>
+          <Archive size={14} className="tree-icon" /> <span className="tree-label">{t('txt_archive')}</span>
         </button>
         <button type="button" className={`tree-btn ${props.sidebarFilter.kind === 'trash' ? 'active' : ''}`} onClick={() => props.onChangeFilter({ kind: 'trash' })}>
           <Trash2 size={14} className="tree-icon" /> <span className="tree-label">{t('txt_trash')}</span>
@@ -108,6 +114,20 @@ export default function VaultSidebar(props: VaultSidebarProps) {
               <span className="tree-label" title={folder.decName || folder.name || folder.id}>
                 {folder.decName || folder.name || folder.id}
               </span>
+            </button>
+            <button
+              type="button"
+              className="folder-delete-btn folder-edit-btn"
+              title={t('txt_edit')}
+              aria-label={t('txt_edit')}
+              disabled={props.busy}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                props.onOpenRenameFolder(folder);
+              }}
+            >
+              <Pencil size={12} />
             </button>
             <button
               type="button"

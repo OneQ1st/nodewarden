@@ -4,6 +4,7 @@ import { copyTextToClipboard } from '@/lib/clipboard';
 import qrcode from 'qrcode-generator';
 import type { Profile } from '@/lib/types';
 import { t } from '@/lib/i18n';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface SettingsPageProps {
   profile: Profile;
@@ -64,7 +65,8 @@ export default function SettingsPage(props: SettingsPageProps) {
     const qr = qrcode(0, 'M');
     qr.addData(buildOtpUri(props.profile.email, secret));
     qr.make();
-    const svg = qr.createSvgTag({ scalable: true, margin: 0 });
+    // Keep a visible quiet zone so authenticator apps can scan reliably in both themes.
+    const svg = qr.createSvgTag({ scalable: true, margin: 4 });
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   }, [props.profile.email, secret]);
 
@@ -83,6 +85,13 @@ export default function SettingsPage(props: SettingsPageProps) {
     const code = await props.onGetRecoveryCode(recoveryMasterPassword);
     setRecoveryCode(code);
     props.onNotify?.('success', t('txt_recovery_code_loaded'));
+  }
+
+  function formatDateTime(value: string | null | undefined): string {
+    if (!value) return t('txt_dash');
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleString();
   }
 
   return (

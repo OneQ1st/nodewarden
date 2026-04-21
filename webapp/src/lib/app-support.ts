@@ -17,6 +17,7 @@ export interface WebVaultSignalRInvocation {
       UserId?: string;
       Date?: string;
       RevisionDate?: string;
+      [key: string]: unknown;
     };
   }>;
 }
@@ -97,7 +98,7 @@ export function buildEmptyImportDraft(type: number): VaultDraft {
     loginUsername: '',
     loginPassword: '',
     loginTotp: '',
-    loginUris: [''],
+    loginUris: [{ uri: '', match: null }],
     loginFido2Credentials: [],
     cardholderName: '',
     cardNumber: '',
@@ -160,16 +161,26 @@ export function importCipherToDraft(cipher: Record<string, unknown>, folderId: s
     draft.loginUsername = asText(login.username);
     draft.loginPassword = asText(login.password);
     draft.loginTotp = asText(login.totp);
-    draft.loginFido2Credentials = Array.isArray(login.fido2Credentials)
-      ? login.fido2Credentials
-          .filter((credential): credential is Record<string, unknown> => !!credential && typeof credential === 'object')
-          .map((credential) => ({ ...credential }))
-      : [];
     const urisRaw = Array.isArray(login.uris) ? login.uris : [];
     const uris = urisRaw
-      .map((u) => asText((u as Record<string, unknown>)?.uri).trim())
-      .filter((u) => !!u);
-    draft.loginUris = uris.length ? uris : [''];
+      .map((u) => {
+        const row = (u || {}) as Record<string, unknown>;
+        const uri = asText(row.uri).trim();
+        const matchRaw = row.match;
+        return {
+          uri,
+          match: typeof matchRaw === 'number' && Number.isFinite(matchRaw) ? matchRaw : null,
+          originalUri: uri,
+          extra: Object.fromEntries(
+            Object.entries(row).filter(([key]) => !['uri', 'match'].includes(key))
+          ),
+        };
+      })
+      .filter((u) => !!u.uri);
+    draft.loginUris = uris.length ? uris : [{ uri: '', match: null, originalUri: '', extra: {} }];
+    draft.loginFido2Credentials = Array.isArray(login.fido2Credentials)
+      ? login.fido2Credentials.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
+      : [];
   } else if (type === 3) {
     const card = (cipher.card || {}) as Record<string, unknown>;
     draft.cardholderName = asText(card.cardholderName);

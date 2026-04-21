@@ -1,6 +1,7 @@
 import { ArrowUpDown, Cloud, Clock3, Folder as FolderIcon, KeyRound, Lock, LogOut, Send as SendIcon, Settings as SettingsIcon, Shield, ShieldUser } from 'lucide-preact';
 import { Link } from 'wouter';
 import AppMainRoutes from '@/components/AppMainRoutes';
+import ThemeSwitch from '@/components/ThemeSwitch';
 import type { AppMainRoutesProps } from '@/components/AppMainRoutes';
 import { t } from '@/lib/i18n';
 import type { Profile } from '@/lib/types';
@@ -15,19 +16,24 @@ interface AppAuthenticatedShellProps {
   settingsAccountRoute: string;
   importRoute: string;
   isImportRoute: boolean;
+  darkMode: boolean;
+  themeToggleTitle: string;
   onLock: () => void;
   onLogout: () => void;
+  onToggleTheme: () => void;
   mainRoutesProps: AppMainRoutesProps;
 }
 
 export default function AppAuthenticatedShell(props: AppAuthenticatedShellProps) {
+  const routeAnimationKey = props.isImportRoute ? props.importRoute : props.location;
+
   return (
     <div className="app-page">
       <div className="app-shell">
         <header className="topbar">
           <div className="brand">
             <img src="/logo-64.png" alt="NodeWarden logo" className="brand-logo" />
-            <span className="brand-name">NodeWarden</span>
+            <img src="/nodewarden-wordmark.svg" alt="NodeWarden" className="brand-wordmark" />
             <span className="mobile-page-title">{props.currentPageTitle}</span>
           </div>
           <div className="topbar-actions">
@@ -35,6 +41,7 @@ export default function AppAuthenticatedShell(props: AppAuthenticatedShellProps)
               <ShieldUser size={16} />
               <span>{props.profile?.email}</span>
             </div>
+            <ThemeSwitch checked={props.darkMode} title={props.themeToggleTitle} onToggle={props.onToggleTheme} />
             <button type="button" className="btn btn-secondary small" onClick={props.onLock}>
               <Lock size={14} className="btn-icon" /> {t('txt_lock')}
             </button>
@@ -49,6 +56,9 @@ export default function AppAuthenticatedShell(props: AppAuthenticatedShellProps)
                 <FolderIcon size={16} className="btn-icon" />
               </button>
             )}
+            <div className="mobile-theme-btn">
+              <ThemeSwitch checked={props.darkMode} title={props.themeToggleTitle} onToggle={props.onToggleTheme} />
+            </div>
             <button type="button" className="btn btn-secondary small mobile-lock-btn" aria-label={t('txt_lock')} title={t('txt_lock')} onClick={props.onLock}>
               <Lock size={14} className="btn-icon" />
             </button>
@@ -98,7 +108,9 @@ export default function AppAuthenticatedShell(props: AppAuthenticatedShellProps)
             </Link>
           </aside>
           <main className="content">
-            <AppMainRoutes {...props.mainRoutesProps} />
+            <div key={routeAnimationKey} className="route-stage">
+              <AppMainRoutes {...props.mainRoutesProps} />
+            </div>
           </main>
         </div>
 

@@ -16,6 +16,7 @@ import {
   type AuthedFetch,
 } from './shared';
 import { readResponseBytesWithProgress } from '../download';
+import { toBufferSource } from '../crypto';
 import { unzipSync, zipSync } from 'fflate';
 
 export type {
@@ -55,6 +56,21 @@ export interface AdminBackupRunResponse {
     remotePath: string;
   };
   settings: AdminBackupSettings;
+}
+
+export interface BackupFileIntegrityCheckResult {
+  hasChecksumPrefix: boolean;
+  expectedPrefix: string | null;
+  actualPrefix: string;
+  matches: boolean;
+}
+
+export interface RemoteBackupIntegrityResponse {
+  object: 'backup-remote-integrity';
+  destinationId: string;
+  path: string;
+  fileName: string;
+  integrity: BackupFileIntegrityCheckResult;
 }
 
 export interface RemoteBackupItem {
@@ -109,6 +125,18 @@ export interface AdminBackupExportPayload {
   bytes: Uint8Array;
 }
 
+export interface BackupExportClientProgressEvent {
+  operation: 'backup-export';
+  source: 'local';
+  step: string;
+  fileName: string;
+  stageTitle: string;
+  stageDetail: string;
+  done?: boolean;
+  ok?: boolean;
+  error?: string | null;
+}
+
 interface BackupExportManifestAttachmentBlob {
   cipherId: string;
   attachmentId: string;
@@ -117,6 +145,25 @@ interface BackupExportManifestAttachmentBlob {
 
 interface BackupExportManifest {
   attachmentBlobs?: BackupExportManifestAttachmentBlob[];
+}
+
+const BACKUP_FILE_HASH_PREFIX_LENGTH = 5;
+
+function extractBackupTimestampFromFileName(fileName: string): string | null {
+  const match = String(fileName || '').match(/nodewarden_backup_(\d{8})_(\d{6})(?:_[0-9a-f]{5})?\.zip$/i);
+  if (!match) return null;
+  return `${match[1]}_${match[2]}`;
+}
+
+function buildBackupFileName(timestamp: string, checksumPrefix: string): string {
+  return `nodewarden_backup_${timestamp}_${checksumPrefix}.zip`;
+}
+
+async function applyBackupFileIntegrityName(fileName: string, bytes: Uint8Array): Promise<string> {
+  const integrity = await verifyBackupFileIntegrity(bytes, fileName);
+  const timestamp = extractBackupTimestampFromFileName(fileName);
+  if (!timestamp) return fileName;
+  return buildBackupFileName(timestamp, integrity.actualPrefix);
 }
 
 export async function exportAdminBackup(
@@ -149,10 +196,21 @@ export async function downloadAdminBackupAttachmentBlob(
 
 export async function buildCompleteAdminBackupExport(
   authedFetch: AuthedFetch,
-  includeAttachments: boolean = false
+  includeAttachments: boolean = false,
+  onProgress?: (event: BackupExportClientProgressEvent) => void | Promise<void>
 ): Promise<AdminBackupExportPayload> {
   const payload = await exportAdminBackup(authedFetch, includeAttachments);
-  if (!includeAttachments) return payload;
+  if (!includeAttachments) {
+    await onProgress?.({
+      operation: 'backup-export',
+      source: 'local',
+      step: 'export_client_save',
+      fileName: payload.fileName,
+      stageTitle: 'txt_backup_export_progress_save_title',
+      stageDetail: 'txt_backup_export_progress_save_detail',
+    });
+    return payload;
+  }
 
   const zipped = unzipSync(payload.bytes);
   const manifestBytes = zipped['manifest.json'];
@@ -167,14 +225,41 @@ export async function buildCompleteAdminBackupExport(
     throw new Error(t('txt_backup_export_failed'));
   }
 
+  await onProgress?.({
+    operation: 'backup-export',
+    source: 'local',
+    step: 'export_client_fetch_attachments',
+    fileName: payload.fileName,
+    stageTitle: 'txt_backup_export_progress_fetch_attachments_title',
+    stageDetail: 'txt_backup_export_progress_fetch_attachments_detail',
+  });
   for (const attachment of manifest.attachmentBlobs || []) {
     const bytes = await downloadAdminBackupAttachmentBlob(authedFetch, attachment.blobName);
     zipped[`attachments/${attachment.cipherId}/${attachment.attachmentId}.bin`] = bytes;
   }
 
+  await onProgress?.({
+    operation: 'backup-export',
+    source: 'local',
+    step: 'export_client_rebuild',
+    fileName: payload.fileName,
+    stageTitle: 'txt_backup_export_progress_rebuild_title',
+    stageDetail: 'txt_backup_export_progress_rebuild_detail',
+  });
+  const rebuiltBytes = zipSync(zipped, { level: 0 });
+  const rebuiltFileName = await applyBackupFileIntegrityName(payload.fileName, rebuiltBytes);
+  await onProgress?.({
+    operation: 'backup-export',
+    source: 'local',
+    step: 'export_client_save',
+    fileName: rebuiltFileName,
+    stageTitle: 'txt_backup_export_progress_save_title',
+    stageDetail: 'txt_backup_export_progress_save_detail',
+  });
   return {
     ...payload,
-    bytes: zipSync(zipped, { level: 0 }),
+    bytes: rebuiltBytes,
+    fileName: rebuiltFileName,
   };
 }
 
@@ -276,6 +361,29 @@ export async function downloadRemoteBackup(
   return { fileName, mimeType, bytes };
 }
 
+export function extractBackupFileChecksumPrefix(fileName: string): string | null {
+  const normalized = String(fileName || '').trim();
+  const match = normalized.match(/_([0-9a-f]{5})\.zip$/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', toBufferSource(bytes));
+  return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export async function verifyBackupFileIntegrity(bytes: Uint8Array, fileName: string): Promise<BackupFileIntegrityCheckResult> {
+  const expectedPrefix = extractBackupFileChecksumPrefix(fileName);
+  const actualHash = await sha256Hex(bytes);
+  const actualPrefix = actualHash.slice(0, BACKUP_FILE_HASH_PREFIX_LENGTH);
+  return {
+    hasChecksumPrefix: !!expectedPrefix,
+    expectedPrefix,
+    actualPrefix,
+    matches: !expectedPrefix || expectedPrefix === actualPrefix,
+  };
+}
+
 export async function deleteRemoteBackup(
   authedFetch: AuthedFetch,
   destinationId: string,
@@ -288,16 +396,32 @@ export async function deleteRemoteBackup(
   if (!resp.ok) throw new Error(await parseErrorMessage(resp, t('txt_backup_remote_delete_failed')));
 }
 
+export async function inspectRemoteBackupIntegrity(
+  authedFetch: AuthedFetch,
+  destinationId: string,
+  path: string
+): Promise<RemoteBackupIntegrityResponse> {
+  const params = new URLSearchParams();
+  params.set('destinationId', destinationId);
+  params.set('path', path);
+  const resp = await authedFetch(`/api/admin/backup/remote/integrity?${params.toString()}`, { method: 'GET' });
+  if (!resp.ok) throw new Error(await parseErrorMessage(resp, t('txt_backup_remote_download_failed')));
+  const body = await parseJson<RemoteBackupIntegrityResponse>(resp);
+  if (!body?.integrity || !body?.fileName) throw new Error(t('txt_backup_remote_invalid_response'));
+  return body;
+}
+
 export async function restoreRemoteBackup(
   authedFetch: AuthedFetch,
   destinationId: string,
   path: string,
-  replaceExisting: boolean = false
+  replaceExisting: boolean = false,
+  allowChecksumMismatch: boolean = false
 ): Promise<AdminBackupImportResponse> {
   const resp = await authedFetch('/api/admin/backup/remote/restore', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ destinationId, path, replaceExisting }),
+    body: JSON.stringify({ destinationId, path, replaceExisting, allowChecksumMismatch }),
   });
   if (!resp.ok) throw new Error(await parseErrorMessage(resp, t('txt_backup_remote_restore_failed')));
   const body = await parseJson<AdminBackupImportResponse>(resp);
@@ -308,12 +432,16 @@ export async function restoreRemoteBackup(
 export async function importAdminBackup(
   authedFetch: AuthedFetch,
   file: File,
-  replaceExisting: boolean = false
+  replaceExisting: boolean = false,
+  allowChecksumMismatch: boolean = false
 ): Promise<AdminBackupImportResponse> {
   const formData = new FormData();
   formData.set('file', file, file.name || 'nodewarden_backup.zip');
   if (replaceExisting) {
     formData.set('replaceExisting', '1');
+  }
+  if (allowChecksumMismatch) {
+    formData.set('allowChecksumMismatch', '1');
   }
 
   const resp = await authedFetch('/api/admin/backup/import', {
