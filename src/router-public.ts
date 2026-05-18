@@ -265,55 +265,65 @@ function iconResponse(body: BodyInit | null, contentType: string | null): Respon
   });
 }
 
-async function handleWebsiteIcon(host: string, fallbackMode: 'default' | 'not-found' = 'default'): Promise<Response> {
+async function handleWebsiteIcon(host: string): Promise<Response> {
   const normalizedHost = normalizeIconHost(host);
-  if (!normalizedHost) return fallbackMode === 'not-found' ? handleMissingWebsiteIcon() : handleNwFavicon();
+  if (!normalizedHost) return handleNwFavicon();
 
-  const encodedHost = encodeURIComponent(normalizedHost);
-  const requestHeaders = { 'User-Agent': 'NodeWarden/1.0' };
-  const upstreamSources: IconSource[] = [
-    {
-      url: `https://favicon.im/zh/${encodedHost}?larger=true&throw-error-on-404=true`,
-      headers: requestHeaders,
-    },
-    {
-      url: `https://icons.bitwarden.net/${encodedHost}/icon.png`,
-      rejectImage: {
-        byteLength: BITWARDEN_DEFAULT_GLOBE_ICON_BYTES,
-        sha256: BITWARDEN_DEFAULT_GLOBE_ICON_SHA256,
-      },
-      headers: requestHeaders,
-    },
-  ];
+  const cache = caches.default;
+  const cacheKey = new Request(`https://nodewarden-icons.local/icons/${normalizedHost}/icon.png`, { method: 'GET' });
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
 
-  for (const source of upstreamSources) {
-    try {
-      const resp = await fetchIconSource(source);
+  let finalResp: Response | null = null;
 
-      if (!resp.ok) continue;
-      const contentType = String(resp.headers.get('Content-Type') || '').toLowerCase();
-      if (!contentType.startsWith('image/')) continue;
+  // 1. Vercel 优先：逐级回退查找（sub.digitalplat.org → digitalplat.org）
+  let parts = normalizedHost.split('.');
+  while (parts.length >= 2) {
+    const currentHost = parts.join('.');
+    const vercelUrl = `https://icon-xi.vercel.app/${currentHost}/icon.png`;
 
-      if (!source.rejectImage) {
-        return iconResponse(resp.body, resp.headers.get('Content-Type'));
-      }
+    const vCheck = await fetch(vercelUrl, {
+      method: 'HEAD',
+      headers: { 'User-Agent': 'NodeWarden/1.0' },
+    });
 
-      const contentLength = Number(resp.headers.get('Content-Length') || '');
-      if (Number.isFinite(contentLength) && contentLength > 0 && contentLength !== source.rejectImage.byteLength) {
-        return iconResponse(resp.body, resp.headers.get('Content-Type'));
-      }
-
-      const bytes = await resp.arrayBuffer();
-      if (bytes.byteLength === 0) continue;
-      if (bytes.byteLength === source.rejectImage.byteLength && (await sha256Hex(bytes)) === source.rejectImage.sha256) continue;
-
-      return iconResponse(bytes, resp.headers.get('Content-Type'));
-    } catch {
-      continue;
+    if (vCheck.ok) {
+      finalResp = await fetch(vercelUrl, {
+        headers: { 'User-Agent': 'NodeWarden/1.0' },
+        cf: { cacheEverything: true, cacheTtl: LIMITS.cache.iconTtlSeconds },
+      });
+      break;
     }
+    parts.shift();
   }
 
-  return fallbackMode === 'not-found' ? handleMissingWebsiteIcon() : handleNwFavicon();
+  // 2. Google 兜底（Vercel 没找到才走这里）
+  if (!finalResp || !finalResp.ok) {
+    const googleUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(normalizedHost)}&sz=64`;
+    finalResp = await fetch(googleUrl, {
+      headers: { 'User-Agent': 'NodeWarden/1.0' },
+      redirect: 'follow',
+      cf: { cacheEverything: true, cacheTtl: LIMITS.cache.iconTtlSeconds },
+    });
+  }
+
+  // 3. 返回并缓存
+  if (finalResp && finalResp.ok) {
+    const body = await finalResp.arrayBuffer();
+    if (body.byteLength === 0) return handleNwFavicon();
+
+    const iconResponse = new Response(body, {
+      status: 200,
+      headers: {
+        'Content-Type': finalResp.headers.get('Content-Type') || 'image/png',
+        'Cache-Control': `public, max-age=${LIMITS.cache.iconTtlSeconds}`,
+      },
+    });
+    await cache.put(cacheKey, iconResponse.clone());
+    return iconResponse;
+  }
+
+  return handleNwFavicon();
 }
 
 export async function buildWebBootstrapResponse(env: Env): Promise<WebBootstrapResponse> {
